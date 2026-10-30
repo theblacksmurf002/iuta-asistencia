@@ -1,5 +1,6 @@
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { SessionProvider } from "@/lib/auth-client";
 
 const geistSans = Geist({
   variable: "--font-sans",
@@ -68,7 +69,9 @@ export default function RootLayout({
         />
       </head>
       <body className="min-h-full flex flex-col antialiased bg-slate-950 text-slate-100" suppressHydrationWarning>
-        {children}
+        <SessionProvider>
+          {children}
+        </SessionProvider>
       </body>
     </html>
   );

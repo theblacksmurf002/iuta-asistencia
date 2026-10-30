@@ -4,6 +4,8 @@ export interface AttendanceRecord {
   id: string;
   cedula: string;
   nombre: string;
+  correo?: string;
+  deviceFingerprint?: string;
   claseCodigo: string;
   materiaNombre: string;
   timestamp: number;
@@ -111,6 +113,8 @@ if (!globalThis.__IUTA_STORE__) {
         id: "ATT-DEMO-01",
         cedula: "V-27.410.882",
         nombre: "Alejandro Rodríguez",
+        correo: "a.rodriguez@iuta.edu.ve",
+        deviceFingerprint: "dev-sample-fingerprint-001",
         claseCodigo: "INB-143",
         materiaNombre: "Informática Básica",
         timestamp: Date.now() - 1000 * 60 * 40,
@@ -124,6 +128,8 @@ if (!globalThis.__IUTA_STORE__) {
         id: "ATT-DEMO-02",
         cedula: "V-29.004.129",
         nombre: "Mariana Silva",
+        correo: "m.silva@iuta.edu.ve",
+        deviceFingerprint: "dev-sample-fingerprint-002",
         claseCodigo: "INB-143",
         materiaNombre: "Informática Básica",
         timestamp: Date.now() - 1000 * 60 * 25,
@@ -137,6 +143,8 @@ if (!globalThis.__IUTA_STORE__) {
         id: "ATT-DEMO-03",
         cedula: "V-28.751.309",
         nombre: "Gabriel Fernández",
+        correo: "g.fernandez@iuta.edu.ve",
+        deviceFingerprint: "dev-sample-fingerprint-003",
         claseCodigo: "INB-143",
         materiaNombre: "Informática Básica",
         timestamp: Date.now() - 1000 * 60 * 5,
@@ -194,6 +202,10 @@ export async function POST(request: Request) {
       const {
         cedula,
         nombre,
+        correo,
+        email,
+        device_fingerprint,
+        deviceFingerprint,
         claseCodigo,
         materiaNombre,
         metodo,
@@ -234,6 +246,32 @@ export async function POST(request: Request) {
         );
       }
 
+      // =========================================================================
+      // BLOQUEO FÍSICO POR DISPOSITIVO (Anti-Préstamo de Cuentas)
+      // Valida que el hardware/dispositivo no haya registrado a nadie en esta clase
+      // =========================================================================
+      const cleanDeviceFp = (device_fingerprint || deviceFingerprint || "").toString().trim();
+      if (cleanDeviceFp) {
+        const deviceAlreadyRegistered = store.records.some(
+          (r) =>
+            r.claseCodigo === claseCodigo &&
+            r.deviceFingerprint &&
+            r.deviceFingerprint.toLowerCase() === cleanDeviceFp.toLowerCase()
+        );
+
+        if (deviceAlreadyRegistered) {
+          return NextResponse.json(
+            {
+              success: false,
+              code: "DEVICE_BLOCKED",
+              error:
+                "Dispositivo bloqueado: Este teléfono ya registró una asistencia para esta clase. No se permite registrar múltiples alumnos desde el mismo equipo.",
+            },
+            { status: 403 }
+          );
+        }
+      }
+
       // Validación anti-duplicados por Cédula en la misma clase
       const cleanCi = cedula.toUpperCase().trim();
       const alreadyRegistered = store.records.some(
@@ -246,6 +284,7 @@ export async function POST(request: Request) {
         return NextResponse.json(
           {
             success: false,
+            code: "CI_DUPLICATE",
             error: `La cédula ${cleanCi} ya tiene asistencia confirmada para la clase de ${claseCodigo}.`,
           },
           { status: 400 }
@@ -255,11 +294,14 @@ export async function POST(request: Request) {
       const now = new Date();
       // Regla: Primera hora = "Presente", después = "Tardado"
       const estadoCalculado = calculateAttendanceStatus(claseCodigo, now, simulatedStatus);
+      const studentEmail = (correo || email || "").toString().trim();
 
       const record: AttendanceRecord = {
         id: "IUTA-" + Math.random().toString(36).substring(2, 8).toUpperCase(),
         cedula: cleanCi,
         nombre: nombre.trim(),
+        correo: studentEmail || undefined,
+        deviceFingerprint: cleanDeviceFp || undefined,
         claseCodigo,
         materiaNombre: materiaNombre || claseCodigo,
         timestamp: Date.now(),

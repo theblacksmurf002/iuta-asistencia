@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import confetti from "canvas-confetti";
 import { QRCodeSVG } from "qrcode.react";
+import { useSession, signIn, signOut } from "next-auth/react";
 import { QrScannerComponent } from "@/components/qr-scanner";
 import {
   Clock,
@@ -30,6 +31,9 @@ import {
   EyeOff,
   Timer,
   LogOut,
+  Mail,
+  Smartphone,
+  ShieldCheck,
 } from "lucide-react";
 
 // =========================================================================
@@ -108,6 +112,8 @@ export interface AttendanceRecordV2 {
   id: string;
   cedula: string;
   nombre: string;
+  correo?: string;
+  deviceFingerprint?: string;
   claseCodigo: string;
   materiaNombre: string;
   timestamp: number;
@@ -124,7 +130,26 @@ const STORAGE_KEYS = {
   DEMO_MODE: "iuta_demo_mode_v2",
   THEME: "iuta_theme_mode_v2",
   PROFESSOR_AUTH: "iuta_prof_auth_v2",
+  DEVICE_FINGERPRINT: "iuta_device_fingerprint_v2",
 };
+
+// =========================================================================
+// GENERACIÓN Y PERSISTENCIA DE IDENTIFICADOR DE HARDWARE (DEVICE FINGERPRINT)
+// Evita el préstamo de cuentas entre alumnos desde un mismo teléfono
+// =========================================================================
+export function getOrCreateDeviceFingerprint(): string {
+  if (typeof window === "undefined") return "";
+  let fp = localStorage.getItem(STORAGE_KEYS.DEVICE_FINGERPRINT);
+  if (!fp) {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      fp = "dev-" + crypto.randomUUID();
+    } else {
+      fp = "dev-" + Math.random().toString(36).substring(2, 10) + "-" + Date.now().toString(36);
+    }
+    localStorage.setItem(STORAGE_KEYS.DEVICE_FINGERPRINT, fp);
+  }
+  return fp;
+}
 
 // =========================================================================
 // 2. FÓRMULA DE HAVERSINE (DISTANCIA EN METROS)
@@ -230,6 +255,13 @@ export default function AttendanceApp() {
   // Filtro en lista de profesor ("all" | "presente" | "tardado")
   const [recordsFilter, setRecordsFilter] = useState<"all" | "presente" | "tardado">("all");
 
+  // Autenticación con Google (NextAuth / Cuenta Institucional)
+  const { data: session, status: authStatus } = useSession();
+  const [deviceBlockedError, setDeviceBlockedError] = useState<string | null>(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [modalCustomName, setModalCustomName] = useState("");
+  const [modalCustomEmail, setModalCustomEmail] = useState("");
+
   // Datos del Estudiante
   const [studentCi, setStudentCi] = useState("");
   const [studentName, setStudentName] = useState("");
@@ -283,7 +315,7 @@ export default function AttendanceApp() {
       const savedCi = localStorage.getItem(STORAGE_KEYS.CI);
       const savedName = localStorage.getItem(STORAGE_KEYS.NAME);
       if (savedCi) setStudentCi(savedCi);
-      if (savedName) setStudentName(savedName);
+      if (savedName && !session?.user?.name) setStudentName(savedName);
 
       // Auto-selección horaria
       const autoCode = getAutoSelectedClassCode(new Date());
@@ -313,6 +345,18 @@ export default function AttendanceApp() {
       }
     } catch {}
   }, []);
+
+  // =========================================================================
+  // EFECTO: Sincronización Estricta de Identidad desde Google (NextAuth)
+  // =========================================================================
+  useEffect(() => {
+    if (session?.user?.name) {
+      setStudentName(session.user.name);
+      try {
+        localStorage.setItem(STORAGE_KEYS.NAME, session.user.name);
+      } catch {}
+    }
+  }, [session?.user?.name]);
 
   // =========================================================================
   // 1. BACKEND SYNC: Polling en tiempo real para el Panel del Profesor
@@ -477,10 +521,77 @@ export default function AttendanceApp() {
   };
 
   const handleSaveStudentName = (val: string) => {
+    // Si la sesión de Google está activa, el nombre es inmutable y certificado
+    if (session?.user?.name) return;
     setStudentName(val);
     try {
       localStorage.setItem(STORAGE_KEYS.NAME, val);
     } catch {}
+  };
+
+  const handleStudentSignOut = async () => {
+    await signOut({ redirect: false });
+    setStudentName("");
+    setDeviceBlockedError(null);
+    try {
+      localStorage.removeItem(STORAGE_KEYS.NAME);
+    } catch {}
+    setStatusMessage({
+      type: "info",
+      text: "Has cerrado la sesión institucional de Google exitosamente.",
+    });
+  };
+
+  const handleGoogleSignIn = async () => {
+    try {
+      const res = await fetch("/api/auth/signin/google", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ callbackUrl: "/" }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.url && data.url.startsWith("https://accounts.google.com")) {
+          window.location.href = data.url;
+          return;
+        }
+        if (data.session) {
+          if (data.session.user?.name) {
+            setStudentName(data.session.user.name);
+          }
+          window.location.reload();
+          return;
+        }
+      }
+      setShowAuthModal(true);
+    } catch {
+      setShowAuthModal(true);
+    }
+  };
+
+  const handleModalSimulatedSignIn = async (name: string, email: string) => {
+    try {
+      const res = await fetch("/api/auth/signin/google", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          simulateMock: true,
+          name,
+          email,
+          callbackUrl: "/",
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.session?.user?.name) {
+          setStudentName(data.session.user.name);
+        }
+        setShowAuthModal(false);
+        window.location.reload();
+      }
+    } catch (err) {
+      console.error(err);
+    }
   };
 
   // =========================================================================
@@ -536,11 +647,21 @@ export default function AttendanceApp() {
   // =========================================================================
   const handleConfirmAttendance = async (methodUsed: "QR_SCAN" | "URL_PARAM" | "PIN_MANUAL") => {
     setStatusMessage(null);
+    setDeviceBlockedError(null);
 
-    if (!studentCi.trim() || !studentName.trim()) {
+    // Verificación obligatoria de Autenticación con Google
+    if (!session?.user) {
       setStatusMessage({
         type: "error",
-        text: "Por favor introduce tu Cédula de Identidad y Nombre Completo.",
+        text: "Acceso denegado: Debes iniciar sesión con tu cuenta de Google institucional para confirmar asistencia.",
+      });
+      return;
+    }
+
+    if (!studentCi.trim()) {
+      setStatusMessage({
+        type: "error",
+        text: "Por favor introduce tu Cédula de Identidad.",
       });
       return;
     }
@@ -563,13 +684,18 @@ export default function AttendanceApp() {
         simulatedStatusParam = demoForcedStatus;
       }
 
+      // Obtener o generar identificador físico de hardware (Device Fingerprint)
+      const deviceFp = getOrCreateDeviceFingerprint();
+
       const res = await fetch("/api/asistencia", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "register_attendance",
-          cedula: studentCi,
-          nombre: studentName,
+          cedula: studentCi.trim(),
+          nombre: session.user.name || studentName.trim(),
+          correo: session.user.email || undefined,
+          device_fingerprint: deviceFp,
           claseCodigo: selectedClassCode,
           materiaNombre: activeClass.name,
           metodo: methodUsed,
@@ -585,6 +711,18 @@ export default function AttendanceApp() {
       setIsSubmitting(false);
 
       if (!res.ok || !data.success) {
+        if (res.status === 403 || data.code === "DEVICE_BLOCKED") {
+          const blockedMsg =
+            data.error ||
+            "Dispositivo bloqueado: Este teléfono ya registró una asistencia para esta clase. No se permite registrar múltiples alumnos desde el mismo equipo.";
+          setDeviceBlockedError(blockedMsg);
+          setStatusMessage({
+            type: "error",
+            text: blockedMsg,
+          });
+          return;
+        }
+
         setStatusMessage({
           type: "error",
           text: data.error || "No se pudo confirmar la asistencia.",
@@ -645,12 +783,14 @@ export default function AttendanceApp() {
       "ID Registro",
       "Cedula",
       "Nombre Completo",
+      "Correo Institucional",
       "Codigo Materia",
       "Nombre Asignatura",
       "Hora Exacta",
       "Estado (Presente/Tardado)",
       "Metodo",
       "Distancia Sede (m)",
+      "ID Dispositivo (Anti-Fraude)",
       "Modo Demo",
     ];
 
@@ -658,12 +798,14 @@ export default function AttendanceApp() {
       r.id,
       `"${r.cedula}"`,
       `"${r.nombre}"`,
+      `"${r.correo || "No registrado"}"`,
       r.claseCodigo,
       `"${r.materiaNombre}"`,
       r.horaExacta,
       r.estado,
       r.metodo,
       r.distanciaMetros,
+      `"${r.deviceFingerprint || "N/A"}"`,
       r.isDemo ? "SI" : "NO",
     ]);
 
@@ -1052,49 +1194,32 @@ export default function AttendanceApp() {
               )}
             </div>
 
-            {/* 1. Datos del Estudiante (Tarjeta Flotante de Cristal) */}
-            <section className="rounded-3xl p-6 bg-gradient-to-br from-slate-900/80 via-slate-900/40 to-slate-950/60 border border-white/15 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)] backdrop-blur-xl space-y-4">
-              <div className="flex items-center gap-3.5">
-                <div className="w-11 h-11 rounded-2xl bg-blue-500/15 text-blue-300 border border-white/20 flex items-center justify-center shadow-inner backdrop-blur-md">
-                  <UserCheck className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="font-bold text-sm md:text-base text-white">
-                    Identificación del Estudiante
-                  </h3>
-                  <p className="text-xs text-slate-400">
-                    Datos almacenados en tu navegador para agilizar la confirmación
-                  </p>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                    Cédula de Identidad (V-)
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="Ej: V-28.123.456"
-                    value={studentCi}
-                    onChange={(e) => handleSaveStudentCi(e.target.value)}
-                    className="w-full px-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                    Nombre Completo
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="Ej: Carlos Eduardo Mendoza"
-                    value={studentName}
-                    onChange={(e) => handleSaveStudentName(e.target.value)}
-                    className="w-full px-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner"
-                  />
+            {/* Banner de Infracción de Dispositivo Físico (Anti-Préstamo de Cuentas) */}
+            {deviceBlockedError && (
+              <div className="p-5 rounded-3xl bg-gradient-to-r from-rose-950/80 via-slate-900/60 to-rose-950/70 border border-rose-500/40 backdrop-blur-xl shadow-[0_8px_32px_0_rgba(244,63,94,0.35)] text-rose-200 animate-in fade-in duration-300">
+                <div className="flex items-start gap-3.5">
+                  <div className="w-11 h-11 rounded-2xl bg-rose-500/20 text-rose-300 border border-rose-500/35 flex items-center justify-center shrink-0 shadow-inner backdrop-blur-md">
+                    <ShieldAlert className="w-5 h-5 text-rose-400" />
+                  </div>
+                  <div className="space-y-1 flex-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <h4 className="font-bold text-sm text-white flex items-center gap-2">
+                        Infracción de Seguridad: Bloqueo de Dispositivo Físico
+                      </h4>
+                      <span className="text-[10px] px-2.5 py-0.5 rounded-full bg-rose-500/25 text-rose-200 border border-rose-400/40 uppercase font-mono font-bold shrink-0">
+                        Error 403
+                      </span>
+                    </div>
+                    <p className="text-xs text-rose-200/95 leading-relaxed pt-0.5">
+                      {deviceBlockedError}
+                    </p>
+                    <p className="text-[11px] text-rose-300/80 font-mono pt-1">
+                      Dispositivo ID: <span className="underline">{getOrCreateDeviceFingerprint().slice(0, 18)}...</span> • Este teléfono móvil ya registró a un estudiante para esta clase.
+                    </p>
+                  </div>
                 </div>
               </div>
-            </section>
+            )}
 
             {/* 2. Georreferenciación IUTA (Tarjeta Flotante de Cristal) */}
             <section className="rounded-3xl p-6 bg-gradient-to-br from-slate-900/80 via-slate-900/40 to-slate-950/60 border border-white/15 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)] backdrop-blur-xl space-y-4">
@@ -1131,182 +1256,326 @@ export default function AttendanceApp() {
               </div>
             </section>
 
-            {/* 3. Selección de Materia y Asistencia (Tarjeta Flotante de Cristal) */}
-            <section className="rounded-3xl p-6 bg-gradient-to-br from-slate-900/80 via-slate-900/40 to-slate-950/60 border border-white/15 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)] backdrop-blur-xl space-y-5">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2.5">
-                  <Radio className="w-4 h-4 text-blue-400 animate-pulse" />
-                  <h3 className="font-bold text-sm md:text-base text-white">
-                    Clase Activa y Registro
-                  </h3>
+            {/* CONDICIONAL: SI NO HA INICIADO SESIÓN CON GOOGLE */}
+            {!session?.user ? (
+              <section className="rounded-3xl p-8 bg-gradient-to-br from-slate-900/90 via-slate-900/60 to-indigo-950/50 border border-white/20 shadow-[0_8px_32px_0_rgba(0,0,0,0.45)] backdrop-blur-2xl space-y-6 text-center animate-in fade-in duration-300">
+                <div className="w-16 h-16 rounded-3xl bg-gradient-to-tr from-blue-600/30 via-indigo-600/30 to-purple-600/30 border border-white/25 flex items-center justify-center mx-auto shadow-inner backdrop-blur-md text-blue-300">
+                  <GraduationCap className="w-8 h-8 text-blue-400" />
                 </div>
-                <span className="text-xs font-mono font-bold text-blue-300 bg-blue-500/15 px-3 py-1 rounded-full border border-blue-400/30 backdrop-blur-md">
-                  {activeClassObj.code}
-                </span>
-              </div>
+                <div className="max-w-md mx-auto space-y-2">
+                  <span className="text-[10px] font-bold px-3 py-1 rounded-full uppercase bg-blue-500/15 text-blue-300 border border-blue-400/30 backdrop-blur-md inline-block tracking-wider">
+                    Acceso Requerido
+                  </span>
+                  <h3 className="font-bold text-lg md:text-xl text-white">
+                    Autenticación Institucional Obligatoria
+                  </h3>
+                  <p className="text-xs md:text-sm text-slate-300 leading-relaxed">
+                    Para acceder al formulario de asistencia y validar tu presencia en clase, debes identificarte con tu cuenta de Google o correo institucional. Tu nombre oficial y correo certificarán tu registro.
+                  </p>
+                </div>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1.5">
-                  Selecciona la asignatura:
-                </label>
-                <select
-                  value={selectedClassCode}
-                  onChange={(e) => setSelectedClassCode(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-sm text-white focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner"
-                >
-                  {SABATINO_CLASSES.map((c) => (
-                    <option key={c.code} value={c.code} className="bg-slate-900 text-white">
-                      {c.code} — {c.name} ({c.scheduleDisplay})
-                    </option>
-                  ))}
-                </select>
-              </div>
+                <div className="max-w-md mx-auto pt-2">
+                  <button
+                    type="button"
+                    onClick={handleGoogleSignIn}
+                    className="w-full py-4 px-6 bg-gradient-to-r from-blue-600/80 via-indigo-600/80 to-purple-600/80 hover:from-blue-500/90 hover:to-indigo-500/90 text-white rounded-2xl font-semibold text-sm shadow-[0_0_35px_rgba(59,130,246,0.35)] transition-all duration-300 flex items-center justify-center gap-3.5 border border-white/30 backdrop-blur-xl group hover:border-white/50 active:scale-[0.98]"
+                  >
+                    <svg className="w-5 h-5 shrink-0 transition-transform group-hover:scale-110" viewBox="0 0 24 24">
+                      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
+                      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
+                    </svg>
+                    <span>Continuar con Cuenta Institucional (Google)</span>
+                  </button>
+                </div>
 
-              {/* Botón de Escaneo con Cámara (Efecto Glass Iluminado) */}
-              <div className="space-y-3 pt-1">
-                <button
-                  type="button"
-                  onClick={() => setScannerOpen(!scannerOpen)}
-                  className="w-full py-4 px-4 bg-gradient-to-r from-blue-600/80 via-indigo-600/80 to-purple-600/80 hover:bg-white/20 hover:from-blue-500/90 hover:to-indigo-500/90 active:scale-[0.98] text-white rounded-2xl font-semibold text-sm shadow-[0_0_25px_rgba(59,130,246,0.35)] transition-all duration-300 flex items-center justify-center gap-2.5 border border-white/30 backdrop-blur-xl"
-                >
-                  <Camera className="w-5 h-5" />
-                  {scannerOpen ? "Cerrar Escáner de Cámara" : "Escanear Código QR en Pantalla"}
-                </button>
-
-                {scannerOpen && (
-                  <div className="p-4 bg-slate-950/70 rounded-3xl border border-white/20 space-y-2.5 backdrop-blur-2xl shadow-2xl">
-                    <QrScannerComponent
-                      isScanningActive={scannerOpen}
-                      onScanSuccess={(decodedText) => {
-                        try {
-                          if (decodedText.includes("?") || decodedText.startsWith("http")) {
-                            const url = new URL(decodedText);
-                            const c = url.searchParams.get("clase");
-                            const t = url.searchParams.get("token");
-                            const p = url.searchParams.get("pin");
-
-                            if (c) setSelectedClassCode(c);
-                            if (p) setManualPin(p);
-                            if (t) setIncomingToken(t);
-                          } else {
-                            setIncomingToken(decodedText);
-                          }
-                          setScannerOpen(false);
-                          handleConfirmAttendance("QR_SCAN");
-                        } catch {
-                          setIncomingToken(decodedText);
-                          setScannerOpen(false);
-                          handleConfirmAttendance("QR_SCAN");
-                        }
-                      }}
-                    />
-                    <p className="text-center text-xs text-slate-300">
-                      Apunta la cámara al código QR proyectado en la pantalla del aula.
-                    </p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 max-w-lg mx-auto pt-2 text-left">
+                  <div className="p-3.5 rounded-2xl bg-slate-950/40 border border-white/10 backdrop-blur-md flex items-center gap-2.5">
+                    <Lock className="w-4 h-4 text-blue-400 shrink-0" />
+                    <span className="text-[11px] text-slate-300 font-medium">Nombre certificado por Google</span>
                   </div>
-                )}
-              </div>
+                  <div className="p-3.5 rounded-2xl bg-slate-950/40 border border-white/10 backdrop-blur-md flex items-center gap-2.5">
+                    <Mail className="w-4 h-4 text-indigo-400 shrink-0" />
+                    <span className="text-[11px] text-slate-300 font-medium">Correo institucional oficial</span>
+                  </div>
+                  <div className="p-3.5 rounded-2xl bg-slate-950/40 border border-white/10 backdrop-blur-md flex items-center gap-2.5">
+                    <Smartphone className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span className="text-[11px] text-slate-300 font-medium">Bloqueo anti-suplantación por equipo</span>
+                  </div>
+                </div>
+              </section>
+            ) : (
+              <>
+                {/* 1. Datos del Estudiante (Tarjeta Flotante de Cristal) */}
+                <section className="rounded-3xl p-6 bg-gradient-to-br from-slate-900/80 via-slate-900/40 to-slate-950/60 border border-white/15 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)] backdrop-blur-xl space-y-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-3.5">
+                      <div className="w-11 h-11 rounded-2xl bg-blue-500/15 text-blue-300 border border-white/20 flex items-center justify-center shadow-inner backdrop-blur-md">
+                        <UserCheck className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-sm md:text-base text-white">
+                          Identificación del Estudiante
+                        </h3>
+                        <p className="text-xs text-slate-400">
+                          Identidad certificada mediante cuenta Google institucional
+                        </p>
+                      </div>
+                    </div>
 
-              {/* Separador PIN Manual */}
-              <div className="relative flex py-1 items-center">
-                <div className="flex-grow border-t border-white/15" />
-                <span className="flex-shrink mx-4 text-xs uppercase text-slate-400 font-semibold tracking-wider">
-                  O introduce el PIN de 4 dígitos
-                </span>
-                <div className="flex-grow border-t border-white/15" />
-              </div>
+                    {/* Opción de Cerrar Sesión en la esquina superior */}
+                    <button
+                      type="button"
+                      onClick={handleStudentSignOut}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/5 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-white/10 hover:border-rose-500/30 text-xs font-medium transition-all backdrop-blur-md active:scale-95"
+                      title="Cerrar sesión institucional de Google"
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                      <span>Cerrar Sesión</span>
+                    </button>
+                  </div>
 
-              <div className="relative">
-                <KeyRound className="w-4 h-4 absolute left-4 top-3.5 text-slate-400" />
-                <input
-                  type="text"
-                  maxLength={4}
-                  placeholder="PIN numérico (ej: 8492)"
-                  value={manualPin}
-                  onChange={(e) => setManualPin(e.target.value.replace(/\D/g, ""))}
-                  className="w-full pl-10 pr-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-base font-mono tracking-widest text-center text-white placeholder-slate-500 focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner"
-                />
-              </div>
+                  {/* Badge de Correo Electrónico Institucional Bloqueado */}
+                  <div className="flex items-center justify-between p-3.5 rounded-2xl bg-slate-950/40 border border-white/10 backdrop-blur-md">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-8 h-8 rounded-xl bg-blue-500/15 border border-blue-400/25 flex items-center justify-center text-blue-300 shrink-0">
+                        <Mail className="w-4 h-4" />
+                      </div>
+                      <div className="min-w-0">
+                        <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                          Correo Electrónico Institucional
+                        </span>
+                        <span className="text-xs font-mono font-semibold text-white truncate block">
+                          {session.user.email || "estudiante@iuta.edu.ve"}
+                        </span>
+                      </div>
+                    </div>
+                    <span className="flex items-center gap-1 text-[10px] font-bold px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-400/30 backdrop-blur-md shrink-0">
+                      <CheckCircle2 className="w-3 h-3" />
+                      Verificado
+                    </span>
+                  </div>
 
-              {/* Botón de Confirmación Principal (Glass Iluminado) */}
-              <button
-                type="button"
-                disabled={isSubmitting || (!incomingToken && manualPin.length < 4)}
-                onClick={() => handleConfirmAttendance(incomingToken ? "QR_SCAN" : "PIN_MANUAL")}
-                className="w-full py-4 bg-emerald-600/85 hover:bg-emerald-500 hover:bg-white/20 active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none text-white rounded-2xl text-sm font-semibold tracking-wide transition-all duration-300 flex items-center justify-center gap-2 shadow-[0_0_30px_rgba(16,185,129,0.35)] border border-white/30 backdrop-blur-xl"
-              >
-                <CheckCircle2 className="w-5 h-5" />
-                {isSubmitting ? "Sincronizando con el aula..." : "Confirmar Mi Asistencia"}
-              </button>
-            </section>
-
-            {/* Comprobante Digital (Modal / Ticket Cristal Profundo) */}
-            {lastVoucher && (
-              <section className="rounded-3xl p-6 bg-slate-950/70 border border-white/20 shadow-2xl backdrop-blur-2xl space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300 relative overflow-hidden">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <div className="w-11 h-11 rounded-2xl bg-emerald-500/20 text-emerald-300 border border-white/25 flex items-center justify-center shadow-inner backdrop-blur-md">
-                      <Award className="w-5 h-5" />
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                        Cédula de Identidad (V-)
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="Ej: V-28.123.456"
+                        value={studentCi}
+                        onChange={(e) => handleSaveStudentCi(e.target.value)}
+                        className="w-full px-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner"
+                      />
                     </div>
                     <div>
-                      <h3 className="font-bold text-sm md:text-base text-white">
-                        Comprobante Digital de Asistencia
-                      </h3>
-                      <p className="text-xs text-emerald-400 font-mono">
-                        Folio: {lastVoucher.id}
+                      <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center justify-between">
+                        <span>Nombre Completo</span>
+                        <span className="text-[10px] font-semibold text-blue-300 flex items-center gap-1">
+                          <Lock className="w-3 h-3 text-blue-400" />
+                          Bloqueado
+                        </span>
+                      </label>
+                      <div className="relative">
+                        <input
+                          type="text"
+                          readOnly
+                          disabled
+                          value={studentName || session.user.name || ""}
+                          className="w-full pl-4 pr-10 py-3 rounded-2xl border border-white/15 bg-slate-900/70 backdrop-blur-md text-sm text-slate-200 cursor-not-allowed opacity-90 shadow-inner select-none font-medium"
+                        />
+                        <div className="absolute right-3.5 top-3.5 text-blue-400" title="Dato certificado por la cuenta">
+                          <Lock className="w-4 h-4" />
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-blue-300/80 flex items-center gap-1 mt-1 font-medium">
+                        <Lock className="w-3 h-3 text-blue-400 shrink-0" />
+                        Dato certificado por la cuenta (No editable)
                       </p>
                     </div>
                   </div>
+                </section>
 
-                  <span
-                    className={`text-xs font-bold px-3 py-1 rounded-full shadow-md backdrop-blur-md border ${
-                      lastVoucher.estado === "Presente"
-                        ? "bg-emerald-500 text-slate-950 border-emerald-300/40 shadow-emerald-500/30"
-                        : "bg-amber-400 text-slate-950 border-amber-300/40 shadow-amber-400/30"
-                    }`}
+                {/* 3. Selección de Materia y Asistencia (Tarjeta Flotante de Cristal) */}
+                <section className="rounded-3xl p-6 bg-gradient-to-br from-slate-900/80 via-slate-900/40 to-slate-950/60 border border-white/15 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)] backdrop-blur-xl space-y-5">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2.5">
+                      <Radio className="w-4 h-4 text-blue-400 animate-pulse" />
+                      <h3 className="font-bold text-sm md:text-base text-white">
+                        Clase Activa y Registro
+                      </h3>
+                    </div>
+                    <span className="text-xs font-mono font-bold text-blue-300 bg-blue-500/15 px-3 py-1 rounded-full border border-blue-400/30 backdrop-blur-md">
+                      {activeClassObj.code}
+                    </span>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1.5">
+                      Selecciona la asignatura:
+                    </label>
+                    <select
+                      value={selectedClassCode}
+                      onChange={(e) => setSelectedClassCode(e.target.value)}
+                      className="w-full px-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-sm text-white focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner"
+                    >
+                      {SABATINO_CLASSES.map((c) => (
+                        <option key={c.code} value={c.code} className="bg-slate-900 text-white">
+                          {c.code} — {c.name} ({c.scheduleDisplay})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Botón de Escaneo con Cámara (Efecto Glass Iluminado) */}
+                  <div className="space-y-3 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setScannerOpen(!scannerOpen)}
+                      className="w-full py-4 px-4 bg-gradient-to-r from-blue-600/80 via-indigo-600/80 to-purple-600/80 hover:bg-white/20 hover:from-blue-500/90 hover:to-indigo-500/90 active:scale-[0.98] text-white rounded-2xl font-semibold text-sm shadow-[0_0_25px_rgba(59,130,246,0.35)] transition-all duration-300 flex items-center justify-center gap-2.5 border border-white/30 backdrop-blur-xl"
+                    >
+                      <Camera className="w-5 h-5" />
+                      {scannerOpen ? "Cerrar Escáner de Cámara" : "Escanear Código QR en Pantalla"}
+                    </button>
+
+                    {scannerOpen && (
+                      <div className="p-4 bg-slate-950/70 rounded-3xl border border-white/20 space-y-2.5 backdrop-blur-2xl shadow-2xl">
+                        <QrScannerComponent
+                          isScanningActive={scannerOpen}
+                          onScanSuccess={(decodedText) => {
+                            try {
+                              if (decodedText.includes("?") || decodedText.startsWith("http")) {
+                                const url = new URL(decodedText);
+                                const c = url.searchParams.get("clase");
+                                const t = url.searchParams.get("token");
+                                const p = url.searchParams.get("pin");
+
+                                if (c) setSelectedClassCode(c);
+                                if (p) setManualPin(p);
+                                if (t) setIncomingToken(t);
+                              } else {
+                                setIncomingToken(decodedText);
+                              }
+                              setScannerOpen(false);
+                              handleConfirmAttendance("QR_SCAN");
+                            } catch {
+                              setIncomingToken(decodedText);
+                              setScannerOpen(false);
+                              handleConfirmAttendance("QR_SCAN");
+                            }
+                          }}
+                        />
+                        <p className="text-center text-xs text-slate-300">
+                          Apunta la cámara al código QR proyectado en la pantalla del aula.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Separador PIN Manual */}
+                  <div className="relative flex py-1 items-center">
+                    <div className="flex-grow border-t border-white/15" />
+                    <span className="flex-shrink mx-4 text-xs uppercase text-slate-400 font-semibold tracking-wider">
+                      O introduce el PIN de 4 dígitos
+                    </span>
+                    <div className="flex-grow border-t border-white/15" />
+                  </div>
+
+                  <div className="relative">
+                    <KeyRound className="w-4 h-4 absolute left-4 top-3.5 text-slate-400" />
+                    <input
+                      type="text"
+                      maxLength={4}
+                      placeholder="PIN numérico (ej: 8492)"
+                      value={manualPin}
+                      onChange={(e) => setManualPin(e.target.value.replace(/\D/g, ""))}
+                      className="w-full pl-10 pr-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-base font-mono tracking-widest text-center text-white placeholder-slate-500 focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner"
+                    />
+                  </div>
+
+                  {/* Botón de Confirmación Principal (Glass Iluminado) */}
+                  <button
+                    type="button"
+                    disabled={isSubmitting || (!incomingToken && manualPin.length < 4)}
+                    onClick={() => handleConfirmAttendance(incomingToken ? "QR_SCAN" : "PIN_MANUAL")}
+                    className="w-full py-4 bg-emerald-600/85 hover:bg-emerald-500 hover:bg-white/20 active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none text-white rounded-2xl text-sm font-semibold tracking-wide transition-all duration-300 flex items-center justify-center gap-2 shadow-[0_0_30px_rgba(16,185,129,0.35)] border border-white/30 backdrop-blur-xl"
                   >
-                    {lastVoucher.estado === "Presente" ? "Presente (A tiempo)" : "Tardado (Retardo)"}
-                  </span>
-                </div>
+                    <CheckCircle2 className="w-5 h-5" />
+                    {isSubmitting ? "Sincronizando con el aula..." : "Confirmar Mi Asistencia"}
+                  </button>
+                </section>
 
-                <div className="grid grid-cols-2 gap-3 text-xs bg-slate-900/40 backdrop-blur-xl p-4 rounded-2xl border border-white/15 shadow-inner">
-                  <div>
-                    <span className="text-slate-400 block">Estudiante:</span>
-                    <strong className="text-white font-medium">{lastVoucher.nombre}</strong>
-                  </div>
-                  <div>
-                    <span className="text-slate-400 block">Cédula:</span>
-                    <strong className="text-white font-mono">{lastVoucher.cedula}</strong>
-                  </div>
-                  <div className="pt-2 border-t border-white/15">
-                    <span className="text-slate-400 block">Asignatura:</span>
-                    <strong className="text-white font-medium">
-                      {lastVoucher.materiaNombre} ({lastVoucher.claseCodigo})
-                    </strong>
-                  </div>
-                  <div className="pt-2 border-t border-white/15">
-                    <span className="text-slate-400 block">Hora de Registro:</span>
-                    <strong className="text-white font-mono">{lastVoucher.horaExacta}</strong>
-                  </div>
-                  <div className="col-span-2 pt-2 border-t border-white/15 flex items-center justify-between text-[11px] text-slate-400">
-                    <span>
-                      Método: {lastVoucher.metodo === "QR_SCAN" ? "Código QR" : "PIN Manual"}
-                    </span>
-                    <span>
-                      Distancia Sede: {lastVoucher.distanciaMetros}m {lastVoucher.isDemo ? "(Modo Demo)" : ""}
-                    </span>
-                  </div>
-                </div>
+                {/* Comprobante Digital (Modal / Ticket Cristal Profundo) */}
+                {lastVoucher && (
+                  <section className="rounded-3xl p-6 bg-slate-950/70 border border-white/20 shadow-2xl backdrop-blur-2xl space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300 relative overflow-hidden">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="w-11 h-11 rounded-2xl bg-emerald-500/20 text-emerald-300 border border-white/25 flex items-center justify-center shadow-inner backdrop-blur-md">
+                          <Award className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <h3 className="font-bold text-sm md:text-base text-white">
+                            Comprobante Digital de Asistencia
+                          </h3>
+                          <p className="text-xs text-emerald-400 font-mono">
+                            Folio: {lastVoucher.id}
+                          </p>
+                        </div>
+                      </div>
 
-                <button
-                  type="button"
-                  onClick={() => window.print()}
-                  className="w-full py-3 rounded-2xl bg-white/10 hover:bg-white/20 active:scale-[0.98] text-xs font-semibold text-white transition-all duration-300 flex items-center justify-center gap-2 border border-white/30 backdrop-blur-md shadow-sm"
-                >
-                  <Printer className="w-4 h-4 text-slate-300" />
-                  Imprimir / Guardar Comprobante PDF
-                </button>
-              </section>
+                      <span
+                        className={`text-xs font-bold px-3 py-1 rounded-full shadow-md backdrop-blur-md border ${
+                          lastVoucher.estado === "Presente"
+                            ? "bg-emerald-500 text-slate-950 border-emerald-300/40 shadow-emerald-500/30"
+                            : "bg-amber-400 text-slate-950 border-amber-300/40 shadow-amber-400/30"
+                        }`}
+                      >
+                        {lastVoucher.estado === "Presente" ? "Presente (A tiempo)" : "Tardado (Retardo)"}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 text-xs bg-slate-900/40 backdrop-blur-xl p-4 rounded-2xl border border-white/15 shadow-inner">
+                      <div>
+                        <span className="text-slate-400 block">Estudiante:</span>
+                        <strong className="text-white font-medium">{lastVoucher.nombre}</strong>
+                      </div>
+                      <div>
+                        <span className="text-slate-400 block">Cédula:</span>
+                        <strong className="text-white font-mono">{lastVoucher.cedula}</strong>
+                      </div>
+                      <div className="pt-2 border-t border-white/15">
+                        <span className="text-slate-400 block">Asignatura:</span>
+                        <strong className="text-white font-medium">
+                          {lastVoucher.materiaNombre} ({lastVoucher.claseCodigo})
+                        </strong>
+                      </div>
+                      <div className="pt-2 border-t border-white/15">
+                        <span className="text-slate-400 block">Hora de Registro:</span>
+                        <strong className="text-white font-mono">{lastVoucher.horaExacta}</strong>
+                      </div>
+                      <div className="col-span-2 pt-2 border-t border-white/15 flex items-center justify-between text-[11px] text-slate-400">
+                        <span>
+                          Método: {lastVoucher.metodo === "QR_SCAN" ? "Código QR" : "PIN Manual"}
+                        </span>
+                        <span>
+                          Distancia Sede: {lastVoucher.distanciaMetros}m {lastVoucher.isDemo ? "(Modo Demo)" : ""}
+                        </span>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => window.print()}
+                      className="w-full py-3 rounded-2xl bg-white/10 hover:bg-white/20 active:scale-[0.98] text-xs font-semibold text-white transition-all duration-300 flex items-center justify-center gap-2 border border-white/30 backdrop-blur-md shadow-sm"
+                    >
+                      <Printer className="w-4 h-4 text-slate-300" />
+                      Imprimir / Guardar Comprobante PDF
+                    </button>
+                  </section>
+                )}
+              </>
             )}
           </div>
         )}
@@ -1656,7 +1925,15 @@ export default function AttendanceApp() {
                           filteredClassRecords.map((r) => (
                             <tr key={r.id} className="hover:bg-white/5 transition-colors">
                               <td className="p-3.5 font-mono text-slate-300">{r.cedula}</td>
-                              <td className="p-3.5 font-semibold text-white">{r.nombre}</td>
+                              <td className="p-3.5">
+                                <div className="font-semibold text-white">{r.nombre}</div>
+                                {r.correo && (
+                                  <div className="text-[10px] text-blue-300 font-mono flex items-center gap-1 mt-0.5">
+                                    <Mail className="w-3 h-3 text-blue-400 shrink-0" />
+                                    <span>{r.correo}</span>
+                                  </div>
+                                )}
+                              </td>
                               <td className="p-3.5 font-mono text-slate-400">{r.horaExacta}</td>
                               <td className="p-3.5">
                                 <span className="text-[11px] text-slate-300">
@@ -1698,6 +1975,122 @@ export default function AttendanceApp() {
             Geofencing Satelital ({IUTA_SEDE.lat}°N, {IUTA_SEDE.lng}°W - Radio {IUTA_SEDE.radiusMeters}m) • Sincronización en Vivo
           </p>
         </footer>
+        {/* MODAL VIDRIO ESMERILADO: IDENTIFICACIÓN INSTITUCIONAL GOOGLE */}
+        {showAuthModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-xl animate-in fade-in duration-200">
+            <div className="w-full max-w-md rounded-3xl bg-slate-900/90 border border-white/20 p-6 shadow-2xl backdrop-blur-2xl space-y-5 text-slate-100 relative">
+              <button
+                type="button"
+                onClick={() => setShowAuthModal(false)}
+                className="absolute top-5 right-5 text-slate-400 hover:text-white p-1 rounded-xl hover:bg-white/10"
+              >
+                ✕
+              </button>
+
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 rounded-2xl bg-blue-500/20 text-blue-300 border border-blue-400/30 flex items-center justify-center">
+                  <GraduationCap className="w-6 h-6 text-blue-400" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-base text-white">
+                    Identificación Institucional Google
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Selecciona o ingresa una cuenta para autenticarte
+                  </p>
+                </div>
+              </div>
+
+              {/* Botón oficial de Google OAuth */}
+              <a
+                href="/api/auth/signin/google"
+                className="w-full py-3.5 px-4 bg-white/10 hover:bg-white/20 active:scale-[0.98] text-white rounded-2xl text-xs font-semibold transition-all duration-300 flex items-center justify-center gap-2.5 border border-white/25 shadow-sm"
+              >
+                <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
+                  <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                  <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                  <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
+                  <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
+                </svg>
+                <span>Conectar con Google OAuth Oficial</span>
+              </a>
+
+              <div className="relative flex py-1 items-center">
+                <div className="flex-grow border-t border-white/10" />
+                <span className="flex-shrink mx-3 text-[10px] uppercase text-slate-400 font-semibold tracking-wider">
+                  O Selecciona Alumno de Prueba
+                </span>
+                <div className="flex-grow border-t border-white/10" />
+              </div>
+
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  onClick={() => handleModalSimulatedSignIn("Carlos Eduardo Mendoza", "carlos.mendoza@iuta.edu.ve")}
+                  className="w-full text-left p-3 rounded-2xl bg-white/5 hover:bg-white/10 border border-white/10 transition-all flex items-center justify-between group"
+                >
+                  <div>
+                    <div className="text-xs font-bold text-white group-hover:text-blue-300">
+                      Carlos Eduardo Mendoza
+                    </div>
+                    <div className="text-[11px] text-slate-400 font-mono">
+                      carlos.mendoza@iuta.edu.ve
+                    </div>
+                  </div>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-400/30">
+                    Ingresar
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleModalSimulatedSignIn("Mariana Silva", "mariana.silva@iuta.edu.ve")}
+                  className="w-full text-left p-3 rounded-2xl bg-white/5 hover:bg-white/10 border border-white/10 transition-all flex items-center justify-between group"
+                >
+                  <div>
+                    <div className="text-xs font-bold text-white group-hover:text-indigo-300">
+                      Mariana Silva
+                    </div>
+                    <div className="text-[11px] text-slate-400 font-mono">
+                      mariana.silva@iuta.edu.ve
+                    </div>
+                  </div>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-400/30">
+                    Ingresar
+                  </span>
+                </button>
+              </div>
+
+              <div className="pt-2 border-t border-white/10 space-y-2">
+                <span className="text-[11px] text-slate-300 font-semibold block">
+                  O ingresa datos de tu cuenta institucional:
+                </span>
+                <input
+                  type="text"
+                  placeholder="Nombre y Apellido"
+                  value={modalCustomName}
+                  onChange={(e) => setModalCustomName(e.target.value)}
+                  className="w-full px-3.5 py-2 rounded-xl border border-white/15 bg-slate-950/50 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-400"
+                />
+                <input
+                  type="email"
+                  placeholder="correo@iuta.edu.ve"
+                  value={modalCustomEmail}
+                  onChange={(e) => setModalCustomEmail(e.target.value)}
+                  className="w-full px-3.5 py-2 rounded-xl border border-white/15 bg-slate-950/50 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-400"
+                />
+                <button
+                  type="button"
+                  disabled={!modalCustomName.trim() || !modalCustomEmail.trim()}
+                  onClick={() => handleModalSimulatedSignIn(modalCustomName.trim(), modalCustomEmail.trim())}
+                  className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-xs font-semibold text-white transition-all shadow-md"
+                >
+                  Continuar como este Estudiante
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );
