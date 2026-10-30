@@ -125,12 +125,15 @@ export interface AttendanceRecordV2 {
 }
 
 const STORAGE_KEYS = {
-  CI: "iuta_student_ci_v2",
+  CI: "iuta_cedula_persistente",
+  LEGACY_CI: "iuta_student_ci_v2",
+  DEVICE_FINGERPRINT: "iuta_device_fingerprint",
+  LEGACY_DEVICE_FINGERPRINT: "iuta_device_fingerprint_v2",
+  CONFIRMED_PREFIX: "iuta_asistencia_confirmada_",
   NAME: "iuta_student_name_v2",
   DEMO_MODE: "iuta_demo_mode_v2",
   THEME: "iuta_theme_mode_v2",
   PROFESSOR_AUTH: "iuta_prof_auth_v2",
-  DEVICE_FINGERPRINT: "iuta_device_fingerprint_v2",
 };
 
 // =========================================================================
@@ -139,15 +142,19 @@ const STORAGE_KEYS = {
 // =========================================================================
 export function getOrCreateDeviceFingerprint(): string {
   if (typeof window === "undefined") return "";
-  let fp = localStorage.getItem(STORAGE_KEYS.DEVICE_FINGERPRINT);
+  let fp =
+    localStorage.getItem(STORAGE_KEYS.DEVICE_FINGERPRINT) ||
+    localStorage.getItem(STORAGE_KEYS.LEGACY_DEVICE_FINGERPRINT);
   if (!fp) {
     if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
       fp = "dev-" + crypto.randomUUID();
     } else {
       fp = "dev-" + Math.random().toString(36).substring(2, 10) + "-" + Date.now().toString(36);
     }
-    localStorage.setItem(STORAGE_KEYS.DEVICE_FINGERPRINT, fp);
   }
+  try {
+    localStorage.setItem(STORAGE_KEYS.DEVICE_FINGERPRINT, fp);
+  } catch {}
   return fp;
 }
 
@@ -308,11 +315,19 @@ export default function AttendanceApp() {
         document.documentElement.classList.add("dark");
       }
 
-      // Estudiante
-      const savedCi = localStorage.getItem(STORAGE_KEYS.CI);
+      // Estudiante (Cédula persistente e inicialización de hardware)
+      const savedCi =
+        localStorage.getItem(STORAGE_KEYS.CI) ||
+        localStorage.getItem(STORAGE_KEYS.LEGACY_CI);
       const savedName = localStorage.getItem(STORAGE_KEYS.NAME);
-      if (savedCi) setStudentCi(savedCi);
+      if (savedCi) {
+        setStudentCi(savedCi);
+        try {
+          localStorage.setItem(STORAGE_KEYS.CI, savedCi);
+        } catch {}
+      }
       if (savedName && !session?.user?.name) setStudentName(savedName);
+      getOrCreateDeviceFingerprint();
 
       // Auto-selección horaria
       const autoCode = getAutoSelectedClassCode(new Date());
@@ -320,6 +335,22 @@ export default function AttendanceApp() {
 
       // Parámetros de URL
       const params = new URLSearchParams(window.location.search);
+      const authError = params.get("error");
+      if (authError) {
+        let errorDesc = "Error al iniciar sesión con Google.";
+        if (authError === "Configuration") {
+          errorDesc = "Error de configuración de Google OAuth: Verifica que la URI autorizada en Google Cloud Console sea http://localhost:3000/api/auth/callback/google y que el cliente no tenga restricciones de host.";
+        } else if (authError === "AccessDenied") {
+          errorDesc = "Acceso denegado por Google: Si la aplicación está en modo prueba ('Testing'), tu cuenta de Gmail debe estar agregada en 'Usuarios de prueba' (Test users) en Google Cloud Console.";
+        } else if (authError === "OAuthCallback" || authError === "Callback") {
+          errorDesc = "Error en el callback de Google: Asegúrate de ingresar desde http://localhost:3000 (mismo dominio exacto configurado en Google Cloud).";
+        }
+        setStatusMessage({
+          type: "error",
+          text: errorDesc,
+        });
+      }
+
       const roleParam = params.get("role");
       if (roleParam === "estudiante" || roleParam === "student") {
         setActiveTab("student");
@@ -378,6 +409,73 @@ export default function AttendanceApp() {
       return () => clearInterval(pollTimer);
     }
   }, [activeTab, isProfessorUnlocked, fetchServerAttendance]);
+
+  // =========================================================================
+  // RECONOCIMIENTO AUTOMÁTICO DE ASISTENCIA PREVIA
+  // Sincroniza desde /api/asistencia y desde localStorage de forma inmediata
+  // =========================================================================
+  const findConfirmedRecord = useCallback(
+    (classCode: string, records: AttendanceRecordV2[]): AttendanceRecordV2 | null => {
+      const userEmail = session?.user?.email?.toLowerCase().trim();
+      const currentCi = (studentCi || "").toUpperCase().trim();
+
+      // 1. Prioridad: Verificar en los registros oficiales sincronizados del backend
+      if (records && records.length > 0) {
+        const serverMatch = records.find((r) => {
+          if (r.claseCodigo !== classCode) return false;
+          if (userEmail && r.correo && r.correo.toLowerCase().trim() === userEmail) return true;
+          if (currentCi && r.cedula.toUpperCase().trim() === currentCi) return true;
+          return false;
+        });
+
+        if (serverMatch) {
+          try {
+            localStorage.setItem(
+              `${STORAGE_KEYS.CONFIRMED_PREFIX}${classCode}`,
+              JSON.stringify(serverMatch)
+            );
+          } catch {}
+          return serverMatch;
+        }
+      }
+
+      // 2. Verificar en almacenamiento local persistente (iuta_asistencia_confirmada_[claseId])
+      try {
+        const localKey = `${STORAGE_KEYS.CONFIRMED_PREFIX}${classCode}`;
+        const localRaw = localStorage.getItem(localKey);
+        if (localRaw) {
+          const parsed = JSON.parse(localRaw) as AttendanceRecordV2;
+          if (parsed && parsed.claseCodigo === classCode) {
+            if (
+              !userEmail ||
+              !parsed.correo ||
+              parsed.correo.toLowerCase().trim() === userEmail ||
+              (currentCi && parsed.cedula.toUpperCase().trim() === currentCi)
+            ) {
+              return parsed;
+            }
+          }
+        }
+      } catch {}
+
+      return null;
+    },
+    [session?.user?.email, studentCi]
+  );
+
+  // Sincronización continua de asistencia confirmada para la clase activa
+  useEffect(() => {
+    if (!mounted) return;
+    const match = findConfirmedRecord(selectedClassCode, attendanceRecords);
+    setLastVoucher(match);
+  }, [mounted, selectedClassCode, attendanceRecords, findConfirmedRecord]);
+
+  // Al iniciar sesión o cambiar cuenta, refrescar registros oficiales del servidor
+  useEffect(() => {
+    if (session?.user) {
+      fetchServerAttendance();
+    }
+  }, [session?.user, fetchServerAttendance]);
 
   // =========================================================================
   // 2. BLOQUEO DE GPS (Vista Estudiante)
@@ -528,10 +626,12 @@ export default function AttendanceApp() {
 
   const handleStudentSignOut = async () => {
     setDeviceBlockedError(null);
-    setStudentName("");
-    try {
-      localStorage.removeItem(STORAGE_KEYS.NAME);
-    } catch {}
+    setStatusMessage(null);
+    // REGLA ESTRICTA: Al cerrar sesión con Google, NO eliminamos ni reseteamos:
+    // - iuta_cedula_persistente
+    // - iuta_device_fingerprint
+    // - iuta_asistencia_confirmada_[claseId]
+    // Únicamente se termina la sesión de autenticación de Google en NextAuth.
     await signOut({ callbackUrl: "/" });
   };
 
@@ -611,6 +711,17 @@ export default function AttendanceApp() {
       return;
     }
 
+    // Bloqueo preventivo en cliente si ya está confirmada para esta clase
+    const existingConfirmation = findConfirmedRecord(selectedClassCode, attendanceRecords);
+    if (existingConfirmation) {
+      setLastVoucher(existingConfirmation);
+      setStatusMessage({
+        type: "info",
+        text: `Tu asistencia para ${selectedClassCode} ya fue confirmada previamente (${existingConfirmation.estado} a las ${existingConfirmation.horaExacta}).`,
+      });
+      return;
+    }
+
     if (!demoMode && gpsStatus !== "allowed") {
       setStatusMessage({
         type: "error",
@@ -656,10 +767,33 @@ export default function AttendanceApp() {
       setIsSubmitting(false);
 
       if (!res.ok || !data.success) {
+        // Si el backend detectó duplicado legítimo (por Cédula o Correo)
+        if (data.code === "CI_DUPLICATE" || data.code === "EMAIL_DUPLICATE") {
+          if (data.record) {
+            const confirmedRec: AttendanceRecordV2 = data.record;
+            setLastVoucher(confirmedRec);
+            try {
+              localStorage.setItem(
+                `${STORAGE_KEYS.CONFIRMED_PREFIX}${selectedClassCode}`,
+                JSON.stringify(confirmedRec)
+              );
+            } catch {}
+            setAttendanceRecords((prev) => {
+              const exists = prev.some((r) => r.id === confirmedRec.id);
+              return exists ? prev : [confirmedRec, ...prev];
+            });
+          }
+          setStatusMessage({
+            type: "info",
+            text: data.error || "Ya cuentas con asistencia registrada para esta clase.",
+          });
+          return;
+        }
+
         if (res.status === 403 || data.code === "DEVICE_BLOCKED") {
           const blockedMsg =
             data.error ||
-            "Dispositivo bloqueado: Este teléfono ya registró una asistencia para esta clase. No se permite registrar múltiples alumnos desde el mismo equipo.";
+            "Dispositivo bloqueado: Este teléfono ya registró una asistencia para esta clase con otro alumno. No se permite registrar múltiples alumnos desde el mismo equipo.";
           setDeviceBlockedError(blockedMsg);
           setStatusMessage({
             type: "error",
@@ -679,6 +813,14 @@ export default function AttendanceApp() {
       setLastVoucher(record);
       setScannerOpen(false);
       setManualPin("");
+
+      // Persistencia inmediata de la confirmación en localStorage
+      try {
+        localStorage.setItem(
+          `${STORAGE_KEYS.CONFIRMED_PREFIX}${selectedClassCode}`,
+          JSON.stringify(record)
+        );
+      } catch {}
 
       setAttendanceRecords((prev) => [record, ...prev]);
 
@@ -1296,75 +1438,30 @@ export default function AttendanceApp() {
                   </div>
                 </section>
 
-                {/* Formulario de Asistencia */}
+                {/* Selector de Asignatura Activa */}
                 <section className="rounded-3xl p-6 bg-gradient-to-br from-slate-900/80 via-slate-900/40 to-slate-950/60 border border-white/15 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)] backdrop-blur-xl space-y-4">
-                  <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-xl bg-blue-500/15 text-blue-300 border border-white/15 flex items-center justify-center shadow-inner backdrop-blur-md">
-                      <ShieldCheck className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <h4 className="font-bold text-sm text-white">
-                        Formulario de Asistencia Oficial
-                      </h4>
-                      <p className="text-xs text-slate-400">
-                        La cédula se almacena de forma persistente en tu dispositivo
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
-                    <div>
-                      <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                        Cédula de Identidad (V-)
-                      </label>
-                      <input
-                        type="text"
-                        placeholder="Ej: V-32843747"
-                        value={studentCi}
-                        onChange={(e) => handleSaveStudentCi(e.target.value)}
-                        className="w-full px-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner font-mono"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center justify-between">
-                        <span>Nombre Completo</span>
-                        <span className="text-[10px] font-semibold text-blue-300 flex items-center gap-1">
-                          <Lock className="w-3 h-3 text-blue-400" />
-                          Dato Certificado
-                        </span>
-                      </label>
-                      <div className="relative">
-                        <input
-                          type="text"
-                          readOnly
-                          disabled
-                          value={session.user.name || ""}
-                          className="w-full pl-4 pr-10 py-3 rounded-2xl border border-white/15 bg-slate-900/70 backdrop-blur-md text-sm text-slate-200 cursor-not-allowed opacity-90 shadow-inner select-none font-medium"
-                        />
-                        <div className="absolute right-3.5 top-3.5 text-blue-400" title="Dato certificado por la cuenta">
-                          <Lock className="w-4 h-4" />
-                        </div>
-                      </div>
-                      <p className="text-[11px] text-blue-300/80 flex items-center gap-1 mt-1 font-medium">
-                        <Lock className="w-3 h-3 text-blue-400 shrink-0" />
-                        Dato certificado por la cuenta (No editable)
-                      </p>
-                    </div>
-                  </div>
-                </section>
-
-                {/* 3. Selección de Materia y Asistencia (Tarjeta Flotante de Cristal) */}
-                <section className="rounded-3xl p-6 bg-gradient-to-br from-slate-900/80 via-slate-900/40 to-slate-950/60 border border-white/15 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)] backdrop-blur-xl space-y-5">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2.5">
                       <Radio className="w-4 h-4 text-blue-400 animate-pulse" />
                       <h3 className="font-bold text-sm md:text-base text-white">
-                        Clase Activa y Registro
+                        Clase Activa del Turno Sabatino
                       </h3>
                     </div>
-                    <span className="text-xs font-mono font-bold text-blue-300 bg-blue-500/15 px-3 py-1 rounded-full border border-blue-400/30 backdrop-blur-md">
-                      {activeClassObj.code}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      {lastVoucher ? (
+                        <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 flex items-center gap-1 backdrop-blur-md">
+                          <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                          Asistencia Confirmada
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 border border-amber-400/30 backdrop-blur-md">
+                          Pendiente de Registro
+                        </span>
+                      )}
+                      <span className="text-xs font-mono font-bold text-blue-300 bg-blue-500/15 px-3 py-1 rounded-full border border-blue-400/30 backdrop-blur-md">
+                        {activeClassObj.code}
+                      </span>
+                    </div>
                   </div>
 
                   <div>
@@ -1383,152 +1480,244 @@ export default function AttendanceApp() {
                       ))}
                     </select>
                   </div>
-
-                  {/* Botón de Escaneo con Cámara (Efecto Glass Iluminado) */}
-                  <div className="space-y-3 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => setScannerOpen(!scannerOpen)}
-                      className="w-full py-4 px-4 bg-gradient-to-r from-blue-600/80 via-indigo-600/80 to-purple-600/80 hover:bg-white/20 hover:from-blue-500/90 hover:to-indigo-500/90 active:scale-[0.98] text-white rounded-2xl font-semibold text-sm shadow-[0_0_25px_rgba(59,130,246,0.35)] transition-all duration-300 flex items-center justify-center gap-2.5 border border-white/30 backdrop-blur-xl"
-                    >
-                      <Camera className="w-5 h-5" />
-                      {scannerOpen ? "Cerrar Escáner de Cámara" : "Escanear Código QR en Pantalla"}
-                    </button>
-
-                    {scannerOpen && (
-                      <div className="p-4 bg-slate-950/70 rounded-3xl border border-white/20 space-y-2.5 backdrop-blur-2xl shadow-2xl">
-                        <QrScannerComponent
-                          isScanningActive={scannerOpen}
-                          onScanSuccess={(decodedText) => {
-                            try {
-                              if (decodedText.includes("?") || decodedText.startsWith("http")) {
-                                const url = new URL(decodedText);
-                                const c = url.searchParams.get("clase");
-                                const t = url.searchParams.get("token");
-                                const p = url.searchParams.get("pin");
-
-                                if (c) setSelectedClassCode(c);
-                                if (p) setManualPin(p);
-                                if (t) setIncomingToken(t);
-                              } else {
-                                setIncomingToken(decodedText);
-                              }
-                              setScannerOpen(false);
-                              handleConfirmAttendance("QR_SCAN");
-                            } catch {
-                              setIncomingToken(decodedText);
-                              setScannerOpen(false);
-                              handleConfirmAttendance("QR_SCAN");
-                            }
-                          }}
-                        />
-                        <p className="text-center text-xs text-slate-300">
-                          Apunta la cámara al código QR proyectado en la pantalla del aula.
-                        </p>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Separador PIN Manual */}
-                  <div className="relative flex py-1 items-center">
-                    <div className="flex-grow border-t border-white/15" />
-                    <span className="flex-shrink mx-4 text-xs uppercase text-slate-400 font-semibold tracking-wider">
-                      O introduce el PIN de 4 dígitos
-                    </span>
-                    <div className="flex-grow border-t border-white/15" />
-                  </div>
-
-                  <div className="relative">
-                    <KeyRound className="w-4 h-4 absolute left-4 top-3.5 text-slate-400" />
-                    <input
-                      type="text"
-                      maxLength={4}
-                      placeholder="PIN numérico (ej: 8492)"
-                      value={manualPin}
-                      onChange={(e) => setManualPin(e.target.value.replace(/\D/g, ""))}
-                      className="w-full pl-10 pr-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-base font-mono tracking-widest text-center text-white placeholder-slate-500 focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner"
-                    />
-                  </div>
-
-                  {/* Botón de Confirmación Principal (Glass Iluminado) */}
-                  <button
-                    type="button"
-                    disabled={isSubmitting || (!incomingToken && manualPin.length < 4)}
-                    onClick={() => handleConfirmAttendance(incomingToken ? "QR_SCAN" : "PIN_MANUAL")}
-                    className="w-full py-4 bg-emerald-600/85 hover:bg-emerald-500 hover:bg-white/20 active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none text-white rounded-2xl text-sm font-semibold tracking-wide transition-all duration-300 flex items-center justify-center gap-2 shadow-[0_0_30px_rgba(16,185,129,0.35)] border border-white/30 backdrop-blur-xl"
-                  >
-                    <CheckCircle2 className="w-5 h-5" />
-                    {isSubmitting ? "Sincronizando con el aula..." : "Confirmar Mi Asistencia"}
-                  </button>
                 </section>
 
-                {/* Comprobante Digital (Modal / Ticket Cristal Profundo) */}
-                {lastVoucher && (
-                  <section className="rounded-3xl p-6 bg-slate-950/70 border border-white/20 shadow-2xl backdrop-blur-2xl space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300 relative overflow-hidden">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="w-11 h-11 rounded-2xl bg-emerald-500/20 text-emerald-300 border border-white/25 flex items-center justify-center shadow-inner backdrop-blur-md">
-                          <Award className="w-5 h-5" />
+                {/* ========================================================== */}
+                {/* ESTADO 1: YA REGISTRÓ ASISTENCIA PREVIAMENTE               */}
+                {/* Muestra directamente el ticket y bloquea duplicados       */}
+                {/* ========================================================== */}
+                {lastVoucher ? (
+                  <section className="rounded-3xl p-6 bg-slate-950/70 border border-emerald-500/30 shadow-[0_8px_32px_0_rgba(16,185,129,0.2)] backdrop-blur-2xl space-y-5 animate-in fade-in zoom-in-95 duration-300 relative overflow-hidden">
+                    <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-emerald-500 via-teal-500 to-blue-500 opacity-90" />
+
+                    {/* Banner Informativo de Asistencia Previa Confirmada */}
+                    <div className="p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/25 text-emerald-200 flex items-start gap-3">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+                      <div className="space-y-0.5 text-left">
+                        <div className="flex items-center gap-2">
+                          <h4 className="text-xs font-bold text-white">
+                            Asistencia Oficialmente Confirmada
+                          </h4>
+                          <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 uppercase">
+                            {lastVoucher.estado}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-emerald-300/90 leading-relaxed">
+                          Ya registraste tu presencia para la clase de <strong className="text-white">{lastVoucher.materiaNombre} ({lastVoucher.claseCodigo})</strong> a las <strong className="font-mono text-white">{lastVoucher.horaExacta}</strong>. Tu comprobante oficial se encuentra activo y los envíos duplicados están bloqueados.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Tarjeta / Ticket de Comprobante Oficial */}
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-11 h-11 rounded-2xl bg-emerald-500/20 text-emerald-300 border border-white/25 flex items-center justify-center shadow-inner backdrop-blur-md">
+                            <Award className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <h3 className="font-bold text-sm md:text-base text-white">
+                              Comprobante Digital de Asistencia
+                            </h3>
+                            <p className="text-xs text-emerald-400 font-mono">
+                              Folio: {lastVoucher.id}
+                            </p>
+                          </div>
+                        </div>
+
+                        <span
+                          className={`text-xs font-bold px-3 py-1 rounded-full shadow-md backdrop-blur-md border ${
+                            lastVoucher.estado === "Presente"
+                              ? "bg-emerald-500 text-slate-950 border-emerald-300/40 shadow-emerald-500/30"
+                              : "bg-amber-400 text-slate-950 border-amber-300/40 shadow-amber-400/30"
+                          }`}
+                        >
+                          {lastVoucher.estado === "Presente" ? "Presente (A tiempo)" : "Tardado (Retardo)"}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3 text-xs bg-slate-900/40 backdrop-blur-xl p-4 rounded-2xl border border-white/15 shadow-inner">
+                        <div>
+                          <span className="text-slate-400 block">Estudiante:</span>
+                          <strong className="text-white font-medium">{lastVoucher.nombre}</strong>
                         </div>
                         <div>
-                          <h3 className="font-bold text-sm md:text-base text-white">
-                            Comprobante Digital de Asistencia
-                          </h3>
-                          <p className="text-xs text-emerald-400 font-mono">
-                            Folio: {lastVoucher.id}
+                          <span className="text-slate-400 block">Cédula:</span>
+                          <strong className="text-white font-mono">{lastVoucher.cedula}</strong>
+                        </div>
+                        <div className="pt-2 border-t border-white/15">
+                          <span className="text-slate-400 block">Asignatura:</span>
+                          <strong className="text-white font-medium">
+                            {lastVoucher.materiaNombre} ({lastVoucher.claseCodigo})
+                          </strong>
+                        </div>
+                        <div className="pt-2 border-t border-white/15">
+                          <span className="text-slate-400 block">Hora de Registro:</span>
+                          <strong className="text-white font-mono">{lastVoucher.horaExacta}</strong>
+                        </div>
+                        <div className="col-span-2 pt-2 border-t border-white/15 flex items-center justify-between text-[11px] text-slate-400">
+                          <span>
+                            Método: {lastVoucher.metodo === "QR_SCAN" ? "Código QR" : "PIN Manual"}
+                          </span>
+                          <span>
+                            Distancia Sede: {lastVoucher.distanciaMetros}m {lastVoucher.isDemo ? "(Modo Demo)" : ""}
+                          </span>
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => window.print()}
+                        className="w-full py-3.5 rounded-2xl bg-white/10 hover:bg-white/20 active:scale-[0.98] text-xs font-semibold text-white transition-all duration-300 flex items-center justify-center gap-2 border border-white/30 backdrop-blur-md shadow-sm"
+                      >
+                        <Printer className="w-4 h-4 text-slate-300" />
+                        Imprimir / Guardar Comprobante PDF
+                      </button>
+                    </div>
+                  </section>
+                ) : (
+                  /* ========================================================== */
+                  /* ESTADO 2: NO HA REGISTRADO ASISTENCIA EN ESTA CLASE        */
+                  /* Muestra el formulario para registrar asistencia            */
+                  /* ========================================================== */
+                  <>
+                    {/* Formulario de Asistencia Oficial */}
+                    <section className="rounded-3xl p-6 bg-gradient-to-br from-slate-900/80 via-slate-900/40 to-slate-950/60 border border-white/15 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)] backdrop-blur-xl space-y-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-9 h-9 rounded-xl bg-blue-500/15 text-blue-300 border border-white/15 flex items-center justify-center shadow-inner backdrop-blur-md">
+                          <ShieldCheck className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <h4 className="font-bold text-sm text-white">
+                            Formulario de Asistencia Oficial
+                          </h4>
+                          <p className="text-xs text-slate-400">
+                            La cédula se almacena de forma persistente en tu dispositivo
                           </p>
                         </div>
                       </div>
 
-                      <span
-                        className={`text-xs font-bold px-3 py-1 rounded-full shadow-md backdrop-blur-md border ${
-                          lastVoucher.estado === "Presente"
-                            ? "bg-emerald-500 text-slate-950 border-emerald-300/40 shadow-emerald-500/30"
-                            : "bg-amber-400 text-slate-950 border-amber-300/40 shadow-amber-400/30"
-                        }`}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
+                        <div>
+                          <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                            Cédula de Identidad (V-)
+                          </label>
+                          <input
+                            type="text"
+                            placeholder="Ej: V-32843747"
+                            value={studentCi}
+                            onChange={(e) => handleSaveStudentCi(e.target.value)}
+                            className="w-full px-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner font-mono"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center justify-between">
+                            <span>Nombre Completo</span>
+                            <span className="text-[10px] font-semibold text-blue-300 flex items-center gap-1">
+                              <Lock className="w-3 h-3 text-blue-400" />
+                              Dato Certificado
+                            </span>
+                          </label>
+                          <div className="relative">
+                            <input
+                              type="text"
+                              readOnly
+                              disabled
+                              value={session.user.name || ""}
+                              className="w-full pl-4 pr-10 py-3 rounded-2xl border border-white/15 bg-slate-900/70 backdrop-blur-md text-sm text-slate-200 cursor-not-allowed opacity-90 shadow-inner select-none font-medium"
+                            />
+                            <div className="absolute right-3.5 top-3.5 text-blue-400" title="Dato certificado por la cuenta">
+                              <Lock className="w-4 h-4" />
+                            </div>
+                          </div>
+                          <p className="text-[11px] text-blue-300/80 flex items-center gap-1 mt-1 font-medium">
+                            <Lock className="w-3 h-3 text-blue-400 shrink-0" />
+                            Dato certificado por la cuenta (No editable)
+                          </p>
+                        </div>
+                      </div>
+                    </section>
+
+                    {/* Métodos de Registro y Validación (QR y PIN Manual) */}
+                    <section className="rounded-3xl p-6 bg-gradient-to-br from-slate-900/80 via-slate-900/40 to-slate-950/60 border border-white/15 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)] backdrop-blur-xl space-y-5">
+                      {/* Botón de Escaneo con Cámara (Efecto Glass Iluminado) */}
+                      <div className="space-y-3 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => setScannerOpen(!scannerOpen)}
+                          className="w-full py-4 px-4 bg-gradient-to-r from-blue-600/80 via-indigo-600/80 to-purple-600/80 hover:bg-white/20 hover:from-blue-500/90 hover:to-indigo-500/90 active:scale-[0.98] text-white rounded-2xl font-semibold text-sm shadow-[0_0_25px_rgba(59,130,246,0.35)] transition-all duration-300 flex items-center justify-center gap-2.5 border border-white/30 backdrop-blur-xl"
+                        >
+                          <Camera className="w-5 h-5" />
+                          {scannerOpen ? "Cerrar Escáner de Cámara" : "Escanear Código QR en Pantalla"}
+                        </button>
+
+                        {scannerOpen && (
+                          <div className="p-4 bg-slate-950/70 rounded-3xl border border-white/20 space-y-2.5 backdrop-blur-2xl shadow-2xl">
+                            <QrScannerComponent
+                              isScanningActive={scannerOpen}
+                              onScanSuccess={(decodedText) => {
+                                try {
+                                  if (decodedText.includes("?") || decodedText.startsWith("http")) {
+                                    const url = new URL(decodedText);
+                                    const c = url.searchParams.get("clase");
+                                    const t = url.searchParams.get("token");
+                                    const p = url.searchParams.get("pin");
+
+                                    if (c) setSelectedClassCode(c);
+                                    if (p) setManualPin(p);
+                                    if (t) setIncomingToken(t);
+                                  } else {
+                                    setIncomingToken(decodedText);
+                                  }
+                                  setScannerOpen(false);
+                                  handleConfirmAttendance("QR_SCAN");
+                                } catch {
+                                  setIncomingToken(decodedText);
+                                  setScannerOpen(false);
+                                  handleConfirmAttendance("QR_SCAN");
+                                }
+                              }}
+                            />
+                            <p className="text-center text-xs text-slate-300">
+                              Apunta la cámara al código QR proyectado en la pantalla del aula.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Separador PIN Manual */}
+                      <div className="relative flex py-1 items-center">
+                        <div className="flex-grow border-t border-white/15" />
+                        <span className="flex-shrink mx-4 text-xs uppercase text-slate-400 font-semibold tracking-wider">
+                          O introduce el PIN de 4 dígitos
+                        </span>
+                        <div className="flex-grow border-t border-white/15" />
+                      </div>
+
+                      <div className="relative">
+                        <KeyRound className="w-4 h-4 absolute left-4 top-3.5 text-slate-400" />
+                        <input
+                          type="text"
+                          maxLength={4}
+                          placeholder="PIN numérico (ej: 8492)"
+                          value={manualPin}
+                          onChange={(e) => setManualPin(e.target.value.replace(/\D/g, ""))}
+                          className="w-full pl-10 pr-4 py-3 rounded-2xl border border-white/15 bg-slate-950/40 backdrop-blur-md text-base font-mono tracking-widest text-center text-white placeholder-slate-500 focus:outline-none focus:border-blue-400/80 focus:ring-4 focus:ring-blue-500/20 transition-all shadow-inner"
+                        />
+                      </div>
+
+                      {/* Botón de Confirmación Principal (Glass Iluminado) */}
+                      <button
+                        type="button"
+                        disabled={isSubmitting || (!incomingToken && manualPin.length < 4)}
+                        onClick={() => handleConfirmAttendance(incomingToken ? "QR_SCAN" : "PIN_MANUAL")}
+                        className="w-full py-4 bg-emerald-600/85 hover:bg-emerald-500 hover:bg-white/20 active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none text-white rounded-2xl text-sm font-semibold tracking-wide transition-all duration-300 flex items-center justify-center gap-2 shadow-[0_0_30px_rgba(16,185,129,0.35)] border border-white/30 backdrop-blur-xl"
                       >
-                        {lastVoucher.estado === "Presente" ? "Presente (A tiempo)" : "Tardado (Retardo)"}
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3 text-xs bg-slate-900/40 backdrop-blur-xl p-4 rounded-2xl border border-white/15 shadow-inner">
-                      <div>
-                        <span className="text-slate-400 block">Estudiante:</span>
-                        <strong className="text-white font-medium">{lastVoucher.nombre}</strong>
-                      </div>
-                      <div>
-                        <span className="text-slate-400 block">Cédula:</span>
-                        <strong className="text-white font-mono">{lastVoucher.cedula}</strong>
-                      </div>
-                      <div className="pt-2 border-t border-white/15">
-                        <span className="text-slate-400 block">Asignatura:</span>
-                        <strong className="text-white font-medium">
-                          {lastVoucher.materiaNombre} ({lastVoucher.claseCodigo})
-                        </strong>
-                      </div>
-                      <div className="pt-2 border-t border-white/15">
-                        <span className="text-slate-400 block">Hora de Registro:</span>
-                        <strong className="text-white font-mono">{lastVoucher.horaExacta}</strong>
-                      </div>
-                      <div className="col-span-2 pt-2 border-t border-white/15 flex items-center justify-between text-[11px] text-slate-400">
-                        <span>
-                          Método: {lastVoucher.metodo === "QR_SCAN" ? "Código QR" : "PIN Manual"}
-                        </span>
-                        <span>
-                          Distancia Sede: {lastVoucher.distanciaMetros}m {lastVoucher.isDemo ? "(Modo Demo)" : ""}
-                        </span>
-                      </div>
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => window.print()}
-                      className="w-full py-3 rounded-2xl bg-white/10 hover:bg-white/20 active:scale-[0.98] text-xs font-semibold text-white transition-all duration-300 flex items-center justify-center gap-2 border border-white/30 backdrop-blur-md shadow-sm"
-                    >
-                      <Printer className="w-4 h-4 text-slate-300" />
-                      Imprimir / Guardar Comprobante PDF
-                    </button>
-                  </section>
+                        <CheckCircle2 className="w-5 h-5" />
+                        {isSubmitting ? "Sincronizando con el aula..." : "Confirmar Mi Asistencia"}
+                      </button>
+                    </section>
+                  </>
                 )}
               </>
             )}

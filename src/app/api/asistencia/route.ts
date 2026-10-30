@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import fs from "fs";
+import path from "path";
 
 export interface AttendanceRecord {
   id: string;
@@ -34,6 +36,35 @@ declare global {
 }
 
 export const PROFESSOR_PASSWORD = "Labor*24";
+
+// =========================================================================
+// PERSISTENCIA EN DISCO (Independiente del ciclo de vida del cliente)
+// Garantiza que los registros no se reinicien al cerrar sesión o recargar
+// =========================================================================
+const STORE_FILE_PATH = path.join(process.cwd(), ".iuta_attendance_store.json");
+
+function loadPersistentStore(): GlobalAttendanceStore | null {
+  try {
+    if (fs.existsSync(STORE_FILE_PATH)) {
+      const raw = fs.readFileSync(STORE_FILE_PATH, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.records) && parsed.session) {
+        return parsed as GlobalAttendanceStore;
+      }
+    }
+  } catch (err) {
+    console.warn("Aviso: No se pudo leer persistencia en disco, usando memoria:", err);
+  }
+  return null;
+}
+
+function savePersistentStore(data: GlobalAttendanceStore) {
+  try {
+    fs.writeFileSync(STORE_FILE_PATH, JSON.stringify(data, null, 2), "utf-8");
+  } catch (err) {
+    console.warn("Aviso: No se pudo guardar persistencia en disco:", err);
+  }
+}
 
 // Horarios oficiales del turno sabatino IUTA
 export const CLASS_TIME_LIMITS: Record<
@@ -98,73 +129,103 @@ export function calculateAttendanceStatus(
   return currentMinutes <= classInfo.firstHourLimitMinutes ? "Presente" : "Tardado";
 }
 
-// Inicialización persistente en memoria global del proceso Node.js
-if (!globalThis.__IUTA_STORE__) {
-  globalThis.__IUTA_STORE__ = {
-    session: {
-      clase: "INB-143",
-      token: "tok-inicial",
-      pin: "1234",
-      timestamp: Date.now(),
-      activa: true,
+const defaultInitialStore: GlobalAttendanceStore = {
+  session: {
+    clase: "INB-143",
+    token: "tok-inicial",
+    pin: "1234",
+    timestamp: Date.now(),
+    activa: true,
+  },
+  records: [
+    {
+      id: "ATT-DEMO-01",
+      cedula: "V-27.410.882",
+      nombre: "Alejandro Rodríguez",
+      correo: "a.rodriguez@iuta.edu.ve",
+      deviceFingerprint: "dev-sample-fingerprint-001",
+      claseCodigo: "INB-143",
+      materiaNombre: "Informática Básica",
+      timestamp: Date.now() - 1000 * 60 * 40,
+      horaExacta: "08:12:15 am",
+      estado: "Presente",
+      metodo: "QR_SCAN",
+      distanciaMetros: 12,
+      isDemo: false,
     },
-    records: [
-      {
-        id: "ATT-DEMO-01",
-        cedula: "V-27.410.882",
-        nombre: "Alejandro Rodríguez",
-        correo: "a.rodriguez@iuta.edu.ve",
-        deviceFingerprint: "dev-sample-fingerprint-001",
-        claseCodigo: "INB-143",
-        materiaNombre: "Informática Básica",
-        timestamp: Date.now() - 1000 * 60 * 40,
-        horaExacta: "08:12:15 am",
-        estado: "Presente",
-        metodo: "QR_SCAN",
-        distanciaMetros: 12,
-        isDemo: false,
-      },
-      {
-        id: "ATT-DEMO-02",
-        cedula: "V-29.004.129",
-        nombre: "Mariana Silva",
-        correo: "m.silva@iuta.edu.ve",
-        deviceFingerprint: "dev-sample-fingerprint-002",
-        claseCodigo: "INB-143",
-        materiaNombre: "Informática Básica",
-        timestamp: Date.now() - 1000 * 60 * 25,
-        horaExacta: "08:35:40 am",
-        estado: "Presente",
-        metodo: "PIN_MANUAL",
-        distanciaMetros: 18,
-        isDemo: false,
-      },
-      {
-        id: "ATT-DEMO-03",
-        cedula: "V-28.751.309",
-        nombre: "Gabriel Fernández",
-        correo: "g.fernandez@iuta.edu.ve",
-        deviceFingerprint: "dev-sample-fingerprint-003",
-        claseCodigo: "INB-143",
-        materiaNombre: "Informática Básica",
-        timestamp: Date.now() - 1000 * 60 * 5,
-        horaExacta: "09:05:22 am",
-        estado: "Tardado",
-        metodo: "QR_SCAN",
-        distanciaMetros: 24,
-        isDemo: false,
-      },
-    ],
-  };
+    {
+      id: "ATT-DEMO-02",
+      cedula: "V-29.004.129",
+      nombre: "Mariana Silva",
+      correo: "m.silva@iuta.edu.ve",
+      deviceFingerprint: "dev-sample-fingerprint-002",
+      claseCodigo: "INB-143",
+      materiaNombre: "Informática Básica",
+      timestamp: Date.now() - 1000 * 60 * 25,
+      horaExacta: "08:35:40 am",
+      estado: "Presente",
+      metodo: "PIN_MANUAL",
+      distanciaMetros: 18,
+      isDemo: false,
+    },
+    {
+      id: "ATT-DEMO-03",
+      cedula: "V-28.751.309",
+      nombre: "Gabriel Fernández",
+      correo: "g.fernandez@iuta.edu.ve",
+      deviceFingerprint: "dev-sample-fingerprint-003",
+      claseCodigo: "INB-143",
+      materiaNombre: "Informática Básica",
+      timestamp: Date.now() - 1000 * 60 * 5,
+      horaExacta: "09:05:22 am",
+      estado: "Tardado",
+      metodo: "QR_SCAN",
+      distanciaMetros: 24,
+      isDemo: false,
+    },
+  ],
+};
+
+// Inicialización persistente en memoria global del proceso Node.js y archivo de respaldo
+if (!globalThis.__IUTA_STORE__) {
+  const loaded = loadPersistentStore();
+  globalThis.__IUTA_STORE__ = loaded || defaultInitialStore;
+  if (!loaded) {
+    savePersistentStore(globalThis.__IUTA_STORE__);
+  }
 }
 
 const store = globalThis.__IUTA_STORE__;
 
-export async function GET() {
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const clase = searchParams.get("clase");
+  const email = searchParams.get("email");
+  const cedula = searchParams.get("cedula");
+
+  let existingRecord: AttendanceRecord | null = null;
+  if (clase && (email || cedula)) {
+    const cleanEmail = email?.toLowerCase().trim();
+    const cleanCi = cedula?.toUpperCase().trim();
+
+    existingRecord =
+      store.records.find((r) => {
+        if (r.claseCodigo !== clase) return false;
+        if (cleanEmail && r.correo && r.correo.toLowerCase().trim() === cleanEmail) {
+          return true;
+        }
+        if (cleanCi && r.cedula.toUpperCase().trim() === cleanCi) {
+          return true;
+        }
+        return false;
+      }) || null;
+  }
+
   return NextResponse.json({
     success: true,
     session: store.session,
     records: store.records,
+    existingRecord,
     serverTime: Date.now(),
   });
 }
@@ -194,7 +255,28 @@ export async function POST(request: Request) {
         timestamp: timestamp ?? Date.now(),
         activa: activa !== undefined ? activa : true,
       };
+      savePersistentStore(store);
       return NextResponse.json({ success: true, session: store.session });
+    }
+
+    // Acción: Comprobación de asistencia previa para un alumno en una clase activa
+    if (action === "check_attendance") {
+      const { claseCodigo, correo, email, cedula } = body;
+      const cleanEmail = (correo || email || "").toString().toLowerCase().trim();
+      const cleanCi = (cedula || "").toString().toUpperCase().trim();
+
+      const existing = store.records.find((r) => {
+        if (r.claseCodigo !== claseCodigo) return false;
+        if (cleanEmail && r.correo && r.correo.toLowerCase().trim() === cleanEmail) return true;
+        if (cleanCi && r.cedula.toUpperCase().trim() === cleanCi) return true;
+        return false;
+      });
+
+      return NextResponse.json({
+        success: true,
+        alreadyRegistered: Boolean(existing),
+        record: existing || null,
+      });
     }
 
     // Acción 2: Estudiante confirma asistencia desde su teléfono
@@ -246,55 +328,86 @@ export async function POST(request: Request) {
         );
       }
 
+      const cleanCi = cedula.toUpperCase().trim();
+      const studentEmail = (correo || email || "").toString().trim();
+
       // =========================================================================
-      // BLOQUEO FÍSICO POR DISPOSITIVO (Anti-Préstamo de Cuentas)
-      // Valida que el hardware/dispositivo no haya registrado a nadie en esta clase
+      // 1. RECONOCIMIENTO Y BLOQUEO ANTI-DUPLICADOS (POR CÉDULA)
+      // =========================================================================
+      const existingByCi = store.records.find(
+        (r) =>
+          r.claseCodigo === claseCodigo &&
+          r.cedula.toUpperCase().trim() === cleanCi
+      );
+
+      if (existingByCi) {
+        return NextResponse.json(
+          {
+            success: false,
+            code: "CI_DUPLICATE",
+            error: `La cédula ${cleanCi} ya tiene asistencia confirmada para la clase de ${claseCodigo}.`,
+            record: existingByCi,
+          },
+          { status: 400 }
+        );
+      }
+
+      // =========================================================================
+      // 2. RECONOCIMIENTO Y BLOQUEO ANTI-DUPLICADOS (POR CORREO)
+      // =========================================================================
+      if (studentEmail) {
+        const existingByEmail = store.records.find(
+          (r) =>
+            r.claseCodigo === claseCodigo &&
+            r.correo &&
+            r.correo.toLowerCase().trim() === studentEmail.toLowerCase()
+        );
+
+        if (existingByEmail) {
+          return NextResponse.json(
+            {
+              success: false,
+              code: "EMAIL_DUPLICATE",
+              error: `El correo ${studentEmail} ya tiene asistencia confirmada para la clase de ${claseCodigo}.`,
+              record: existingByEmail,
+            },
+            { status: 400 }
+          );
+        }
+      }
+
+      // =========================================================================
+      // 3. BLOQUEO FÍSICO POR DISPOSITIVO (Anti-Préstamo de Cuentas)
+      // Valida que el hardware no haya registrado a OTRO alumno en esta clase.
+      // Si el mismo alumno ya registró, se manejó arriba como duplicado legítimo.
       // =========================================================================
       const cleanDeviceFp = (device_fingerprint || deviceFingerprint || "").toString().trim();
       if (cleanDeviceFp) {
-        const deviceAlreadyRegistered = store.records.some(
+        const deviceAlreadyUsedByOther = store.records.some(
           (r) =>
             r.claseCodigo === claseCodigo &&
             r.deviceFingerprint &&
-            r.deviceFingerprint.toLowerCase() === cleanDeviceFp.toLowerCase()
+            r.deviceFingerprint.toLowerCase() === cleanDeviceFp.toLowerCase() &&
+            r.cedula.toUpperCase().trim() !== cleanCi &&
+            (!studentEmail || !r.correo || r.correo.toLowerCase().trim() !== studentEmail.toLowerCase())
         );
 
-        if (deviceAlreadyRegistered) {
+        if (deviceAlreadyUsedByOther) {
           return NextResponse.json(
             {
               success: false,
               code: "DEVICE_BLOCKED",
               error:
-                "Dispositivo bloqueado: Este teléfono ya registró una asistencia para esta clase. No se permite registrar múltiples alumnos desde el mismo equipo.",
+                "Dispositivo bloqueado: Este teléfono ya registró una asistencia para esta clase con otro alumno. No se permite registrar múltiples estudiantes desde el mismo equipo.",
             },
             { status: 403 }
           );
         }
       }
 
-      // Validación anti-duplicados por Cédula en la misma clase
-      const cleanCi = cedula.toUpperCase().trim();
-      const alreadyRegistered = store.records.some(
-        (r) =>
-          r.claseCodigo === claseCodigo &&
-          r.cedula.toUpperCase().trim() === cleanCi
-      );
-
-      if (alreadyRegistered) {
-        return NextResponse.json(
-          {
-            success: false,
-            code: "CI_DUPLICATE",
-            error: `La cédula ${cleanCi} ya tiene asistencia confirmada para la clase de ${claseCodigo}.`,
-          },
-          { status: 400 }
-        );
-      }
-
       const now = new Date();
       // Regla: Primera hora = "Presente", después = "Tardado"
       const estadoCalculado = calculateAttendanceStatus(claseCodigo, now, simulatedStatus);
-      const studentEmail = (correo || email || "").toString().trim();
 
       const record: AttendanceRecord = {
         id: "IUTA-" + Math.random().toString(36).substring(2, 8).toUpperCase(),
@@ -317,6 +430,7 @@ export async function POST(request: Request) {
       };
 
       store.records = [record, ...store.records];
+      savePersistentStore(store);
 
       return NextResponse.json({
         success: true,
@@ -335,6 +449,7 @@ export async function POST(request: Request) {
         );
       }
       store.records = [];
+      savePersistentStore(store);
       return NextResponse.json({ success: true, records: [] });
     }
 

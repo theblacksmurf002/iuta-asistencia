@@ -23,6 +23,7 @@
 # misc
 .DS_Store
 *.pem
+.iuta_attendance_store.json
 
 # debug
 npm-debug.log*
