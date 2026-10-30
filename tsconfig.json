@@ -19,9 +19,7 @@
       }
     ],
     "paths": {
-      "@/*": ["./src/*"],
-      "next-auth/react": ["./src/lib/auth-client"],
-      "next-auth": ["./src/lib/auth-types"]
+      "@/*": ["./src/*"]
     }
   },
   "include": [
